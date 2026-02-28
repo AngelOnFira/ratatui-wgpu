@@ -658,6 +658,13 @@ impl<'s, P: PostProcessor, S: RenderSurface<'s>> Backend for WgpuBackend<'_, 's,
                     }
 
                     pending_cache_updates.entry(key).or_insert_with(|| {
+                        // Try procedural rendering for box-drawing, block elements, braille
+                        if let Some(image) = crate::utils::custom_glyphs::try_rasterize_custom_glyph(
+                            ch, cached.width, cached.height,
+                        ) {
+                            return (*cached, image, false);
+                        }
+
                         let is_emoji = ch.is_emoji_char()
                             && !matches!(ch.general_category_group(), GeneralCategoryGroup::Number);
 
