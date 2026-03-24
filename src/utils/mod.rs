@@ -14,6 +14,7 @@ use raqote::Vector;
 use rustybuzz::ttf_parser::colr::CompositeMode;
 use rustybuzz::Face;
 
+pub(crate) mod custom_glyphs;
 pub(crate) mod plan_cache;
 pub(crate) mod text_atlas;
 

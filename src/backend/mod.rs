@@ -386,8 +386,6 @@ struct TextVertexMember {
     fg_color: u32,
     underline_pos: u32,
     underline_color: u32,
-    strikeout_pos: u32,
-    strikeout_color: u32,
 }
 
 struct TextCacheBgPipeline {

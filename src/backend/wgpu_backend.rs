@@ -88,8 +88,6 @@ pub(super) struct RenderInfo {
     cached: CacheRect,
     underline_pos_min: u16,
     underline_pos_max: u16,
-    strikeout_pos_min: u16,
-    strikeout_pos_max: u16,
 }
 /// Map from (x, y, glyph) -> (cell index, cache entry).
 /// We use an IndexMap because we want a consistent rendering order for
@@ -177,6 +175,67 @@ impl<'f, 's, P: PostProcessor, S: RenderSurface<'s>> WgpuBackend<'f, 's, P, S> {
     /// backend.
     pub fn post_processor_mut(&mut self) -> &mut P {
         &mut self.post_process
+    }
+
+    /// Get the current font size in pixels.
+    pub fn font_size_px(&self) -> u32 {
+        self.fonts.height_px()
+    }
+
+    /// Get the cell aspect ratio (width / height).
+    pub fn cell_aspect(&self) -> f64 {
+        self.fonts.min_width_px() as f64 / self.fonts.height_px() as f64
+    }
+
+    /// Change the font size and re-layout the grid. Invalidates the glyph
+    /// cache and rebuilds the render state for the new cell dimensions.
+    pub fn set_font_size_px(
+        &mut self,
+        size: u32,
+    ) {
+        if size == 0 || size == self.fonts.height_px() {
+            return;
+        }
+
+        let old_size = self.fonts.height_px();
+        self.fonts.set_size_px(size);
+        self.cached.match_fonts(&self.fonts);
+        self.plan_cache = PlanCache::new(self.fonts.count().max(2));
+
+        let (inset_width, inset_height) = match self.viewport {
+            Viewport::Full => (0, 0),
+            Viewport::Shrink { width, height } => (width, height),
+        };
+
+        let width = self.surface_config.width - inset_width;
+        let height = self.surface_config.height - inset_height;
+
+        let chars_wide = width / self.fonts.min_width_px();
+        let chars_high = height / self.fonts.height_px();
+
+        self.cells.clear();
+        self.rendered.clear();
+        self.sourced.clear();
+        self.fast_blinking.clear();
+        self.slow_blinking.clear();
+        self.dirty_rows.clear();
+
+        self.wgpu_state = build_wgpu_state(
+            &self.device,
+            chars_wide * self.fonts.min_width_px(),
+            chars_high * self.fonts.height_px(),
+        );
+
+        self.post_process.resize(
+            &self.device,
+            &self.wgpu_state.text_dest_view,
+            &self.surface_config,
+        );
+
+        info!(
+            "Font size changed from {}px to {}px (grid {}x{})",
+            old_size, size, chars_wide, chars_high,
+        );
     }
 
     /// Resize the rendering surface. This should be called e.g. to keep the
@@ -410,6 +469,7 @@ impl<'s, P: PostProcessor, S: RenderSurface<'s>> Backend for WgpuBackend<'_, 's,
         self.slow_blinking
             .resize(bounds.height as usize * bounds.width as usize, false);
         self.dirty_rows.resize(bounds.height as usize, true);
+        self.dirty_rows.fill(true);
 
         for (x, y, cell) in content {
             let index = y as usize * bounds.width as usize + x as usize;
@@ -592,10 +652,7 @@ impl<'s, P: PostProcessor, S: RenderSurface<'s>> Backend for WgpuBackend<'_, 's,
                     // cluster, and that the remaining characters are all combining characters
                     // which don't need an underline.
                     let set = if advance != 0 {
-                        Modifier::BOLD
-                            | Modifier::ITALIC
-                            | Modifier::UNDERLINED
-                            | Modifier::CROSSED_OUT
+                        Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED
                     } else {
                         Modifier::BOLD | Modifier::ITALIC
                     };
@@ -636,56 +693,13 @@ impl<'s, P: PostProcessor, S: RenderSurface<'s>> Backend for WgpuBackend<'_, 's,
                     let mut underline_pos_min = 0;
                     let mut underline_pos_max = 0;
                     if key.style.contains(Modifier::UNDERLINED) {
-                        let underline_position = metrics.ascender() as f32
-                            - metrics
-                                .underline_metrics()
-                                .map(|m| m.position as f32)
-                                .unwrap_or(0.0);
-                        let underline_position = (underline_position * advance_scale) as u16;
-
+                        let underline_position = (metrics.ascender() as f32 * advance_scale) as u16;
                         let underline_thickness = metrics
                             .underline_metrics()
-                            .map(|m| m.thickness as f32)
-                            .unwrap_or(100.0); // observed average
-                                               // default underlines are a bit thin for larger font-sizes.
-                        let underline_thickness =
-                            (underline_thickness * 1.3 * advance_scale).max(1.0) as u16;
-
-                        // might overflow the box
-                        if underline_position + underline_thickness < cached.height as u16 {
-                            underline_pos_min = underline_position;
-                            underline_pos_max = underline_pos_min + underline_thickness;
-                        } else {
-                            underline_pos_min =
-                                (cached.height as u16).saturating_sub(underline_thickness);
-                            underline_pos_max = cached.height as u16;
-                        }
-                    }
-
-                    let mut strikeout_pos_min = 0;
-                    let mut strikeout_pos_max = 0;
-                    if key.style.contains(Modifier::CROSSED_OUT) {
-                        let strikeout_position = metrics
-                            .strikeout_metrics()
-                            .map(|m| m.position)
-                            .unwrap_or_default();
-                        let strikeout_position = if strikeout_position > 0 {
-                            metrics.ascender() as f32 - strikeout_position as f32
-                        } else {
-                            metrics.ascender() as f32 * 0.7f32 // observed average
-                        };
-                        let strikeout_position = (strikeout_position * advance_scale) as u16;
-
-                        let strikeout_thickness = metrics
-                            .strikeout_metrics()
-                            .map(|m| m.thickness as f32)
-                            .unwrap_or(100.0); // observed average
-                                               // default strikeout lines are a bit thin for larger font-sizes.
-                        let strikeout_thickness =
-                            (strikeout_thickness * 1.8 * advance_scale).max(1.0) as u16;
-
-                        strikeout_pos_min = strikeout_position;
-                        strikeout_pos_max = strikeout_pos_min + strikeout_thickness;
+                            .map(|m| (m.thickness as f32 * advance_scale) as u16)
+                            .unwrap_or(1);
+                        underline_pos_min = underline_position;
+                        underline_pos_max = underline_pos_min + underline_thickness;
                     }
 
                     self.rendered[offset].insert(
@@ -695,8 +709,6 @@ impl<'s, P: PostProcessor, S: RenderSurface<'s>> Backend for WgpuBackend<'_, 's,
                             cached: *cached,
                             underline_pos_min,
                             underline_pos_max,
-                            strikeout_pos_min,
-                            strikeout_pos_max,
                         },
                     );
                     for x_offset in 0..chars_wide as usize {
@@ -708,6 +720,13 @@ impl<'s, P: PostProcessor, S: RenderSurface<'s>> Backend for WgpuBackend<'_, 's,
                     }
 
                     pending_cache_updates.entry(key).or_insert_with(|| {
+                        // Try procedural rendering for box-drawing, block elements, braille
+                        if let Some(image) = crate::utils::custom_glyphs::try_rasterize_custom_glyph(
+                            ch, cached.width, cached.height,
+                        ) {
+                            return (*cached, image, false);
+                        }
+
                         let is_emoji = ch.is_emoji_char()
                             && !matches!(ch.general_category_group(), GeneralCategoryGroup::Number);
 
@@ -881,8 +900,6 @@ impl<'s, P: PostProcessor, S: RenderSurface<'s>> Backend for WgpuBackend<'_, 's,
                         cached,
                         underline_pos_min,
                         underline_pos_max,
-                        strikeout_pos_min,
-                        strikeout_pos_max,
                     },
                 ) in to_render.iter()
                 {
@@ -911,7 +928,6 @@ impl<'s, P: PostProcessor, S: RenderSurface<'s>> Backend for WgpuBackend<'_, 's,
 
                     let [r, g, b] = underline_color;
                     let underline_color = u32::from_be_bytes([r, g, b, alpha]);
-                    let strikeout_color = u32::from_be_bytes([r, g, b, alpha]);
 
                     for offset_x in (0..cached.width).step_by(self.fonts.min_width_px() as usize) {
                         self.text_indices.push([
@@ -920,7 +936,7 @@ impl<'s, P: PostProcessor, S: RenderSurface<'s>> Backend for WgpuBackend<'_, 's,
                             index_offset + 2, // x, y + h
                             index_offset + 2, // x, y + h
                             index_offset + 3, // x + w, y + h
-                            index_offset + 1, // x + w, y
+                            index_offset + 1, // x + w y
                         ]);
                         index_offset += 4;
 
@@ -951,8 +967,6 @@ impl<'s, P: PostProcessor, S: RenderSurface<'s>> Backend for WgpuBackend<'_, 's,
 
                         let underline_pos = ((*underline_pos_min as u32 + uvy) << 16)
                             | (*underline_pos_max as u32 + uvy);
-                        let strikeout_pos = ((*strikeout_pos_min as u32 + uvy) << 16)
-                            | (*strikeout_pos_max as u32 + uvy);
 
                         self.text_vertices.push(TextVertexMember {
                             vertex: [x, y],
@@ -960,8 +974,6 @@ impl<'s, P: PostProcessor, S: RenderSurface<'s>> Backend for WgpuBackend<'_, 's,
                             fg_color,
                             underline_pos,
                             underline_color,
-                            strikeout_pos,
-                            strikeout_color,
                         });
                         self.text_vertices.push(TextVertexMember {
                             vertex: [x + self.fonts.min_width_px() as f32, y],
@@ -969,8 +981,6 @@ impl<'s, P: PostProcessor, S: RenderSurface<'s>> Backend for WgpuBackend<'_, 's,
                             fg_color,
                             underline_pos,
                             underline_color,
-                            strikeout_pos,
-                            strikeout_color,
                         });
                         self.text_vertices.push(TextVertexMember {
                             vertex: [x, y + self.fonts.height_px() as f32],
@@ -978,8 +988,6 @@ impl<'s, P: PostProcessor, S: RenderSurface<'s>> Backend for WgpuBackend<'_, 's,
                             fg_color,
                             underline_pos,
                             underline_color,
-                            strikeout_pos,
-                            strikeout_color,
                         });
                         self.text_vertices.push(TextVertexMember {
                             vertex: [
@@ -993,8 +1001,6 @@ impl<'s, P: PostProcessor, S: RenderSurface<'s>> Backend for WgpuBackend<'_, 's,
                             fg_color,
                             underline_pos,
                             underline_color,
-                            strikeout_pos,
-                            strikeout_color,
                         });
                     }
                 }
@@ -1187,10 +1193,8 @@ fn rasterize_glyph(
     }
 
     if let Some(raster) = metrics.glyph_raster_image(GlyphId(info.glyph_id as _), u16::MAX) {
-        if raster.width != 0 && raster.height != 0 {
-            if let Some(value) = extract_bw_image(&mut image, raster, cached, advance_scale) {
-                return value;
-            }
+        if let Some(value) = extract_bw_image(&mut image, raster, cached, advance_scale) {
+            return value;
         }
     }
 
@@ -1406,12 +1410,12 @@ mod tests {
     use image::GenericImageView;
     use image::ImageBuffer;
     use image::Rgba;
-    use ratatui_core::style::Color;
-    use ratatui_core::style::Stylize;
-    use ratatui_core::terminal::Terminal;
-    use ratatui_core::text::Line;
-    use ratatui_widgets::block::Block;
-    use ratatui_widgets::paragraph::Paragraph;
+    use ratatui::style::Color;
+    use ratatui::style::Stylize;
+    use ratatui::text::Line;
+    use ratatui::widgets::Block;
+    use ratatui::widgets::Paragraph;
+    use ratatui::Terminal;
     use rustybuzz::ttf_parser::RasterGlyphImage;
     use rustybuzz::ttf_parser::RasterImageFormat;
     use serial_test::serial;

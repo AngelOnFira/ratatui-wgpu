@@ -84,8 +84,8 @@ impl<'a> Fonts<'a> {
         Self {
             char_width: font.char_width(size_px),
             char_height: size_px,
+            regular: vec![font.clone()],
             last_resort: font,
-            regular: vec![],
             bold: vec![],
             italic: vec![],
             bold_italic: vec![],
